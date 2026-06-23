@@ -31,7 +31,9 @@ jobs:
           cache: true
 
       - name: Install dependencies
-        run: flutter pub get
+        run: |
+          flutter pub cache clean
+          flutter pub get
 
       - name: Build release APK
         run: flutter build apk --release
