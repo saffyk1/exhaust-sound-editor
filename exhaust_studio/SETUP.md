@@ -71,7 +71,7 @@ Open `android/app/build.gradle` and update the `defaultConfig` block:
 android {
     defaultConfig {
         minSdkVersion 24        // ffmpeg_kit_flutter requires API 24 minimum
-        targetSdkVersion 35
+        targetSdkVersion 34
         ...
     }
 
