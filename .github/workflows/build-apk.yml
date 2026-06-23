@@ -40,9 +40,9 @@ jobs:
         run: flutter pub get
 
       # Clean Android build (correct path now)
-      - name: Clean Gradle
-        working-directory: exhaust_studio/android
-        run: ./gradlew clean
+      #- name: Clean Gradle
+      #  working-directory: exhaust_studio/android
+      #  run: ./gradlew clean
 
       # Build APK
       - name: Build release APK
