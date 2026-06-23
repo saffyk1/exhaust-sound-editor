@@ -185,6 +185,21 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
   VideoPlayerController? _videoController;
   bool _isLoading = false;
 
+  // ── Noise cleanup slider (0.0 = open, 1.0 = tight) ────────────────────────
+  double _noiseCleanup = 0.5;
+  // OPEN (0.0): HPF=60Hz, LPF=9000Hz — keeps more of the sound
+  // TIGHT (1.0): HPF=180Hz, LPF=4000Hz — aggressive wind & hiss removal
+  int get _noiseHpfHz => (60 + (_noiseCleanup * 120)).round();
+  int get _noiseLpfHz => (9000 - (_noiseCleanup * 5000)).round();
+  // Signal chain position: true = noise cleanup BEFORE preset, false = AFTER
+  bool _noiseBeforePreset = true;
+
+  // ── Enhanced preview state (loaded after processing, before final save) ────
+  VideoPlayerController? _enhancedController;
+  File? _enhancedFile;
+  bool _showingEnhanced = false;
+  String? _enhancedTempPath;
+
   // ── Tuning ─────────────────────────────────────────────────────────────────
   TuningMode _tuningMode  = TuningMode.presets;
   FilterParams _params    = kDefaultParams;
@@ -211,11 +226,28 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
     _pulseController = AnimationController(vsync: this, duration: const Duration(milliseconds: 900))..repeat(reverse: true);
     _pulseAnimation  = Tween<double>(begin: 0.7, end: 1.0).animate(CurvedAnimation(parent: _pulseController, curve: Curves.easeInOut));
     _loadCustomPresets();
+    // Request permissions as soon as the first frame renders so the system
+    // dialog appears on app open rather than only when the button is tapped.
+    WidgetsBinding.instance.addPostFrameCallback((_) => _requestStartupPermissions());
+  }
+
+  Future<void> _requestStartupPermissions() async {
+    if (!mounted) return;
+    if (Platform.isAndroid) {
+      // READ_MEDIA_VIDEO exists only on Android 13+ (API 33+).
+      // READ_EXTERNAL_STORAGE covers Android 10–12.
+      // Requesting both is harmless — the OS ignores whichever doesn't apply.
+      await Permission.videos.request();
+      await Permission.storage.request();
+    } else {
+      await Permission.photos.request();
+    }
   }
 
   @override
   void dispose() {
     _videoController?.dispose();
+    _enhancedController?.dispose();
     _pulseController.dispose();
     _saveNameCtrl.dispose();
     super.dispose();
@@ -240,8 +272,7 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
   // ── Mode switching ─────────────────────────────────────────────────────────
   void _switchToManual() => setState(() {
     _tuningMode   = TuningMode.manual;
-    _manualParams = kDefaultParams;
-    _params       = kDefaultParams;
+    _manualParams = _params;  // carry over the active preset's values
     _selectedPreset = '';
   });
 
@@ -293,34 +324,7 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
     await _saveCustomPresets();
   }
 
-  // ── Permissions ────────────────────────────────────────────────────────────
-  Future<void> _ensurePermissions() async {
-    if (Platform.isAndroid) {
-      // Android 13+ uses READ_MEDIA_VIDEO; older uses READ_EXTERNAL_STORAGE.
-      // Check status first — calling request() when already permanently denied
-      // silently returns without showing any dialog.
-      PermissionStatus status = await Permission.videos.status;
-      if (status.isDenied) {
-        status = await Permission.videos.request();
-      }
-      if (status.isPermanentlyDenied) {
-        _showOpenSettingsDialog(); return;
-      }
-
-      if (!status.isGranted) {
-        // Fallback for Android ≤12 where READ_MEDIA_VIDEO is not available.
-        PermissionStatus legacy = await Permission.storage.status;
-        if (legacy.isDenied) legacy = await Permission.storage.request();
-        if (legacy.isPermanentlyDenied) {
-          _showOpenSettingsDialog(); return;
-        }
-      }
-    } else {
-      final status = await Permission.photos.request();
-      if (status.isPermanentlyDenied) { _showOpenSettingsDialog(); return; }
-    }
-  }
-
+  // ── Open Settings helper ───────────────────────────────────────────────────
   void _showOpenSettingsDialog() {
     if (!mounted) return;
     showDialog(
@@ -347,18 +351,28 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
   }
 
   // ── Video picking ──────────────────────────────────────────────────────────
+  // On Android 13+ the OS Photo Picker handles its own access — no permission
+  // needed before opening it. On older Android the startup request covers it.
+  // We do NOT gate the picker on permission status; we just open it and let
+  // the OS decide. If the user has permanently denied access, we direct them
+  // to Settings instead.
   Future<void> _pickVideo() async {
     if (_isLoading) return;
-    // Request permissions first (shows dialog if not yet decided, or opens
-    // Settings dialog if permanently denied). On Android 13+ the system Photo
-    // Picker can work even without READ_MEDIA_VIDEO, so we don't abort here —
-    // we let the picker itself surface any remaining access issues.
-    await _ensurePermissions();
+
+    // If already permanently denied, no point trying — send to Settings.
+    if (Platform.isAndroid) {
+      final videoStatus   = await Permission.videos.status;
+      final storageStatus = await Permission.storage.status;
+      if (videoStatus.isPermanentlyDenied && storageStatus.isPermanentlyDenied) {
+        _showOpenSettingsDialog(); return;
+      }
+    }
 
     try {
       final XFile? picked = await _picker.pickVideo(source: ImageSource.gallery);
       if (picked == null) return;
       final file = File(picked.path);
+      _discardEnhanced(); // clear any pending comparison before new video
       await _initVideoController(file);
       setState(() => _videoFile = file);
     } catch (e) {
@@ -377,28 +391,95 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
   // ── FFmpeg processing ──────────────────────────────────────────────────────
   Future<void> _processVideo() async {
     if (_videoFile == null || _isLoading) return;
-    final cacheDir  = await getTemporaryDirectory();
-    final timestamp = DateTime.now().millisecondsSinceEpoch;
+    final cacheDir   = await getTemporaryDirectory();
+    final timestamp  = DateTime.now().millisecondsSinceEpoch;
     final tempOutput = p.join(cacheDir.path, 'exhaust_studio_$timestamp.mp4');
     final inputPath  = _videoFile!.path;
-    final command    = '-y -i "$inputPath" -c:v copy -af "${_params.filterChain}" "$tempOutput"';
+
+    final noiseFilter = 'highpass=f=$_noiseHpfHz, lowpass=f=$_noiseLpfHz';
+    final chainStr    = _noiseBeforePreset
+        ? '$noiseFilter, ${_params.filterChain}'
+        : '${_params.filterChain}, $noiseFilter';
+    final command = '-y -i "$inputPath" -c:v copy -af "$chainStr" "$tempOutput"';
 
     if (!mounted) return;
     await Navigator.push(context, MaterialPageRoute(builder: (_) => WaveformScreen(
       inputPath: inputPath, outputPath: tempOutput, ffmpegCommand: command,
       onComplete: () async {
-        try {
-          final saved = await _saveToGallery(tempOutput, timestamp);
-          try { File(tempOutput).deleteSync(); } catch (_) {}
-          if (mounted) { Navigator.pop(context); _showSuccessSheet(saved); }
-        } catch (e) {
-          if (mounted) { Navigator.pop(context); _showStatus('Gallery save failed: $e', isError: true); }
-        }
+        // Load enhanced into main screen for comparison — DON'T save yet
+        await _loadEnhanced(tempOutput, timestamp);
+        if (mounted) Navigator.pop(context);
       },
       onError: (err) {
         if (mounted) { Navigator.pop(context); _showStatus('Processing failed.', isError: true); }
       },
     )));
+  }
+
+  // ── Enhanced video helpers ─────────────────────────────────────────────────
+
+  Future<void> _loadEnhanced(String tempPath, int timestamp) async {
+    await _enhancedController?.dispose();
+    final ctrl = VideoPlayerController.file(File(tempPath));
+    await ctrl.initialize();
+    ctrl.setLooping(true);
+    // Start muted — _switchToView will unmute when user selects ENHANCED
+    ctrl.setVolume(0);
+    if (mounted) {
+      setState(() {
+        _enhancedController = ctrl;
+        _enhancedFile       = File(tempPath);
+        _enhancedTempPath   = tempPath;
+        _showingEnhanced    = false; // start on ORIGINAL so user hears the difference
+      });
+    }
+  }
+
+  Future<void> _switchToView(bool showEnhanced) async {
+    final from = showEnhanced ? _videoController    : _enhancedController;
+    final to   = showEnhanced ? _enhancedController : _videoController;
+    if (to == null) return;
+    final pos = from?.value.position ?? Duration.zero;
+    final wasPlaying = from?.value.isPlaying ?? false;
+    from?.pause();
+    from?.setVolume(0);
+    to.setVolume(1);
+    await to.seekTo(pos);
+    if (wasPlaying) to.play();
+    setState(() => _showingEnhanced = showEnhanced);
+  }
+
+  Future<void> _saveEnhanced() async {
+    final path = _enhancedTempPath;
+    if (path == null) return;
+    setState(() => _isLoading = true);
+    try {
+      // Ensure original video is playing (not enhanced) so its controller is paused
+      _enhancedController?.pause();
+      final timestamp = DateTime.now().millisecondsSinceEpoch;
+      final saved = await _saveToGallery(path, timestamp);
+      try { File(path).deleteSync(); } catch (_) {}
+      _discardEnhanced();
+      setState(() => _isLoading = false);
+      _showSuccessSheet(saved);
+    } catch (e) {
+      setState(() => _isLoading = false);
+      _showStatus('Gallery save failed: $e', isError: true);
+    }
+  }
+
+  void _discardEnhanced() {
+    final path = _enhancedTempPath;
+    if (path != null) { try { File(path).deleteSync(); } catch (_) {} }
+    _enhancedController?.dispose();
+    setState(() {
+      _enhancedController = null;
+      _enhancedFile       = null;
+      _enhancedTempPath   = null;
+      _showingEnhanced    = false;
+    });
+    // Restore original volume
+    _videoController?.setVolume(1);
   }
 
   Future<String> _saveToGallery(String tempPath, int timestamp) async {
@@ -470,6 +551,10 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
         child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
           _buildVideoSection(),
           const SizedBox(height: 28),
+          _buildDividerLabel('NOISE CLEANUP'),
+          const SizedBox(height: 14),
+          _buildNoiseCleanupSection(),
+          const SizedBox(height: 28),
           _buildDividerLabel('TUNING PROFILE'),
           const SizedBox(height: 14),
           _buildModeSwitcher(),
@@ -483,6 +568,83 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
           const SizedBox(height: 28),
           _buildEnhanceButton(),
         ]),
+      ),
+    );
+  }
+
+  // ── Noise cleanup section ─────────────────────────────────────────────────
+  Widget _buildNoiseCleanupSection() {
+    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      Row(children: [
+        const Icon(Icons.filter_alt_outlined, color: Color(0xFFFF6B00), size: 16),
+        const SizedBox(width: 8),
+        const Text('NOISE CLEANUP',
+            style: TextStyle(fontFamily: 'monospace', fontWeight: FontWeight.w700, fontSize: 12, letterSpacing: 1.4, color: Color(0xFFCCCCCC))),
+        const Spacer(),
+        Text('HPF ${_noiseHpfHz}Hz · LPF ${_noiseLpfHz}Hz',
+            style: const TextStyle(fontFamily: 'monospace', fontSize: 10, color: Color(0xFFFF6B00), letterSpacing: 0.5)),
+      ]),
+      const SizedBox(height: 4),
+      const Padding(
+        padding: EdgeInsets.only(left: 24),
+        child: Text('Removes wind buffet, tyre hiss & road rumble',
+            style: TextStyle(fontSize: 10, color: Color(0xFF555555), letterSpacing: 0.3)),
+      ),
+      SliderTheme(
+        data: SliderTheme.of(context).copyWith(
+          trackHeight: 3,
+          thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 9),
+        ),
+        child: Slider(
+          value: _noiseCleanup,
+          onChanged: (v) => setState(() => _noiseCleanup = v),
+        ),
+      ),
+      Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 12),
+        child: Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: const [
+          Text('OPEN', style: TextStyle(fontSize: 9, color: Color(0xFF444444), letterSpacing: 1)),
+          Text('TIGHT', style: TextStyle(fontSize: 9, color: Color(0xFF444444), letterSpacing: 1)),
+        ]),
+      ),
+      const SizedBox(height: 10),
+      // ── Signal chain position ───────────────────────────────────────────
+      Row(children: [
+        const Text('APPLY:', style: TextStyle(fontFamily: 'monospace', fontSize: 9, color: Color(0xFF555555), letterSpacing: 1.2)),
+        const SizedBox(width: 8),
+        _chainOrderTab('BEFORE PRESET', isActive: _noiseBeforePreset,  onTap: () => setState(() => _noiseBeforePreset = true)),
+        const SizedBox(width: 4),
+        _chainOrderTab('AFTER PRESET',  isActive: !_noiseBeforePreset, onTap: () => setState(() => _noiseBeforePreset = false)),
+      ]),
+      const SizedBox(height: 4),
+      Padding(
+        padding: const EdgeInsets.only(left: 52),
+        child: Text(
+          _noiseBeforePreset
+              ? 'Cleans raw audio first, then shapes exhaust tone'
+              : 'Shapes tone first, then removes any residual noise',
+          style: const TextStyle(fontSize: 9, color: Color(0xFF444444), letterSpacing: 0.2),
+        ),
+      ),
+    ]);
+  }
+
+  Widget _chainOrderTab(String label, {required bool isActive, required VoidCallback onTap}) {
+    return GestureDetector(
+      onTap: onTap,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 160),
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+        decoration: BoxDecoration(
+          color: isActive ? const Color(0xFF2A2A2A) : Colors.transparent,
+          border: Border.all(color: isActive ? const Color(0xFFFF6B00) : const Color(0xFF333333)),
+          borderRadius: BorderRadius.circular(3),
+        ),
+        child: Text(label, style: TextStyle(
+          fontFamily: 'monospace', fontSize: 9, letterSpacing: 1,
+          color: isActive ? const Color(0xFFFF6B00) : const Color(0xFF555555),
+          fontWeight: isActive ? FontWeight.w700 : FontWeight.w400,
+        )),
       ),
     );
   }
@@ -713,10 +875,30 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
 
   // ── Video section ─────────────────────────────────────────────────────────
   Widget _buildVideoSection() {
-    final hasVideo = _videoController?.value.isInitialized ?? false;
-    return GestureDetector(
-      onTap: hasVideo ? null : _pickVideo,
-      child: AspectRatio(
+    final hasVideo    = _videoController?.value.isInitialized ?? false;
+    final hasEnhanced = _enhancedController?.value.isInitialized ?? false;
+
+    return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+
+      // ── ORIGINAL / ENHANCED toggle (visible only after processing) ────────
+      if (hasEnhanced) ...[
+        Container(
+          padding: const EdgeInsets.all(3),
+          decoration: BoxDecoration(
+            color: const Color(0xFF0F0F0F),
+            border: Border.all(color: const Color(0xFF2A2A2A)),
+            borderRadius: BorderRadius.circular(5),
+          ),
+          child: Row(children: [
+            _viewTab('◀  ORIGINAL', isActive: !_showingEnhanced, onTap: () => _switchToView(false)),
+            _viewTab('ENHANCED  ▶', isActive: _showingEnhanced,  onTap: () => _switchToView(true)),
+          ]),
+        ),
+        const SizedBox(height: 8),
+      ],
+
+      // ── Video frame ───────────────────────────────────────────────────────
+      AspectRatio(
         aspectRatio: 16 / 9,
         child: AnimatedContainer(
           duration: const Duration(milliseconds: 300),
@@ -728,39 +910,132 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
           child: hasVideo ? _buildVideoPlayer() : _buildEmptyPlaceholder(),
         ),
       ),
+
+      if (!hasVideo) ...[
+        const SizedBox(height: 12),
+        OutlinedButton.icon(
+          onPressed: _pickVideo,
+          icon: const Icon(Icons.video_library_outlined, size: 18),
+          label: const Text('SELECT VIDEO FROM GALLERY',
+              style: TextStyle(fontFamily: 'monospace', fontSize: 12, letterSpacing: 1.4)),
+          style: OutlinedButton.styleFrom(
+            foregroundColor: const Color(0xFFFF6B00),
+            side: const BorderSide(color: Color(0xFFFF6B00)),
+            minimumSize: const Size.fromHeight(48),
+            shape: const RoundedRectangleBorder(borderRadius: BorderRadius.all(Radius.circular(4))),
+          ),
+        ),
+      ],
+
+      // ── Save / Discard bar (visible only after processing) ────────────────
+      if (hasEnhanced) ...[
+        const SizedBox(height: 12),
+        Row(children: [
+          OutlinedButton.icon(
+            onPressed: _discardEnhanced,
+            icon: const Icon(Icons.delete_outline, size: 16, color: Color(0xFF666666)),
+            label: const Text('DISCARD', style: TextStyle(color: Color(0xFF666666))),
+            style: OutlinedButton.styleFrom(
+              side: const BorderSide(color: Color(0xFF2A2A2A)),
+              shape: const RoundedRectangleBorder(borderRadius: BorderRadius.all(Radius.circular(4))),
+              textStyle: const TextStyle(fontFamily: 'monospace', fontSize: 11, letterSpacing: 1.4),
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 14),
+            ),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: ElevatedButton.icon(
+              onPressed: _isLoading ? null : _saveEnhanced,
+              icon: const Icon(Icons.save_alt, size: 18),
+              label: const Text('SAVE TO GALLERY'),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: const Color(0xFFFF6B00),
+                foregroundColor: Colors.black,
+                shape: const RoundedRectangleBorder(borderRadius: BorderRadius.all(Radius.circular(4))),
+                textStyle: const TextStyle(fontFamily: 'monospace', fontSize: 12, fontWeight: FontWeight.w800, letterSpacing: 1.4),
+              ),
+            ),
+          ),
+        ]),
+        const SizedBox(height: 4),
+        const Text('Adjust settings and re-process anytime before saving',
+            style: TextStyle(fontSize: 9, color: Color(0xFF3A3A3A), letterSpacing: 0.3)),
+      ],
+    ]);
+  }
+
+  Widget _viewTab(String label, {required bool isActive, required VoidCallback onTap}) {
+    return Expanded(
+      child: GestureDetector(
+        onTap: onTap,
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 180),
+          padding: const EdgeInsets.symmetric(vertical: 10),
+          decoration: BoxDecoration(
+            color: isActive ? const Color(0xFF2A2A2A) : Colors.transparent,
+            borderRadius: BorderRadius.circular(3),
+          ),
+          alignment: Alignment.center,
+          child: Text(label, style: TextStyle(
+            fontFamily: 'monospace', fontSize: 11, fontWeight: FontWeight.w700,
+            letterSpacing: 1.2,
+            color: isActive ? const Color(0xFFE0E0E0) : const Color(0xFF555555),
+          )),
+        ),
+      ),
     );
   }
 
   Widget _buildEmptyPlaceholder() => Column(mainAxisAlignment: MainAxisAlignment.center, children: [
     Container(width: 60, height: 60,
       decoration: BoxDecoration(border: Border.all(color: const Color(0xFF333333), width: 1.5), shape: BoxShape.circle),
-      child: const Icon(Icons.add, color: Color(0xFF555555), size: 28)),
+      child: const Icon(Icons.video_library_outlined, color: Color(0xFF555555), size: 28)),
     const SizedBox(height: 14),
-    const Text('Upload Ride Video', style: TextStyle(color: Color(0xFF555555), fontFamily: 'monospace', fontSize: 13, letterSpacing: 1.2)),
+    const Text('No Video Selected', style: TextStyle(color: Color(0xFF555555), fontFamily: 'monospace', fontSize: 13, letterSpacing: 1.2)),
     const SizedBox(height: 6),
-    const Text('tap to select from gallery', style: TextStyle(color: Color(0xFF383838), fontSize: 11)),
+    const Text('use the button below', style: TextStyle(color: Color(0xFF383838), fontSize: 11)),
   ]);
 
-  Widget _buildVideoPlayer() => ClipRRect(
-    borderRadius: BorderRadius.circular(5),
-    child: Stack(alignment: Alignment.center, children: [
-      VideoPlayer(_videoController!),
-      GestureDetector(
-        onTap: () => setState(() { _videoController!.value.isPlaying ? _videoController!.pause() : _videoController!.play(); }),
-        child: AnimatedOpacity(opacity: _videoController!.value.isPlaying ? 0.0 : 1.0, duration: const Duration(milliseconds: 200),
-          child: Container(width: 52, height: 52, decoration: BoxDecoration(color: Colors.black.withOpacity(0.65), shape: BoxShape.circle),
-            child: const Icon(Icons.play_arrow, color: Colors.white, size: 30))),
-      ),
-      Positioned(top: 8, right: 8,
-        child: GestureDetector(onTap: _pickVideo,
-          child: Container(padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-            decoration: BoxDecoration(color: Colors.black.withOpacity(0.7), borderRadius: BorderRadius.circular(3), border: Border.all(color: const Color(0xFF333333))),
-            child: const Text('REPLACE', style: TextStyle(fontFamily: 'monospace', fontSize: 10, color: Color(0xFFAAAAAA), letterSpacing: 1))))),
-      Positioned(left: 0, right: 0, bottom: 0,
-        child: VideoProgressIndicator(_videoController!, allowScrubbing: true,
-          colors: VideoProgressColors(playedColor: const Color(0xFFFF6B00), bufferedColor: Colors.white.withOpacity(0.2), backgroundColor: Colors.black.withOpacity(0.4)))),
-    ]),
-  );
+  Widget _buildVideoPlayer() {
+    final ctrl = (_showingEnhanced && _enhancedController != null)
+        ? _enhancedController!
+        : _videoController!;
+    final isPlaying = ctrl.value.isPlaying;
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(5),
+      child: Stack(alignment: Alignment.center, children: [
+        VideoPlayer(ctrl),
+        GestureDetector(
+          onTap: () => setState(() { isPlaying ? ctrl.pause() : ctrl.play(); }),
+          child: AnimatedOpacity(opacity: isPlaying ? 0.0 : 1.0, duration: const Duration(milliseconds: 200),
+            child: Container(width: 52, height: 52, decoration: BoxDecoration(color: Colors.black.withOpacity(0.65), shape: BoxShape.circle),
+              child: const Icon(Icons.play_arrow, color: Colors.white, size: 30))),
+        ),
+        Positioned(top: 8, right: 8,
+          child: GestureDetector(onTap: _pickVideo,
+            child: Container(padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+              decoration: BoxDecoration(color: Colors.black.withOpacity(0.7), borderRadius: BorderRadius.circular(3), border: Border.all(color: const Color(0xFF333333))),
+              child: const Text('REPLACE', style: TextStyle(fontFamily: 'monospace', fontSize: 10, color: Color(0xFFAAAAAA), letterSpacing: 1))))),
+        // Mode badge when comparing
+        if (_enhancedController != null)
+          Positioned(top: 8, left: 8,
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
+              decoration: BoxDecoration(
+                color: Colors.black.withOpacity(0.75), borderRadius: BorderRadius.circular(3),
+                border: Border.all(color: _showingEnhanced ? const Color(0xFFFF6B00) : const Color(0xFF444444)),
+              ),
+              child: Text(_showingEnhanced ? 'ENHANCED' : 'ORIGINAL', style: TextStyle(
+                fontFamily: 'monospace', fontSize: 9, letterSpacing: 1.2, fontWeight: FontWeight.w700,
+                color: _showingEnhanced ? const Color(0xFFFF6B00) : const Color(0xFF888888),
+              )),
+            )),
+        Positioned(left: 0, right: 0, bottom: 0,
+          child: VideoProgressIndicator(ctrl, allowScrubbing: true,
+            colors: VideoProgressColors(playedColor: const Color(0xFFFF6B00), bufferedColor: Colors.white.withOpacity(0.2), backgroundColor: Colors.black.withOpacity(0.4)))),
+      ]),
+    );
+  }
 
   // ── Pipeline readout ──────────────────────────────────────────────────────
   Widget _buildPipelineReadout() {
@@ -800,7 +1075,7 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
       child: ElevatedButton.icon(
         onPressed: canProcess ? _processVideo : null,
         icon: const Icon(Icons.bolt, size: 20),
-        label: const Text('ENHANCE & SAVE TO GALLERY'),
+        label: const Text('ENHANCE & PREVIEW'),
       ),
     );
   }
