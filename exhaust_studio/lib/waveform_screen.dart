@@ -3,10 +3,10 @@ import 'dart:io';
 import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:video_player/video_player.dart';
-import 'package:ffmpeg_kit_flutter_video/ffmpeg_kit.dart';
-import 'package:ffmpeg_kit_flutter_video/ffmpeg_session.dart';
-import 'package:ffmpeg_kit_flutter_video/return_code.dart';
-import 'package:ffmpeg_kit_flutter_video/log.dart' as fflog;
+import 'package:ffmpeg_kit_flutter_new/ffmpeg_kit.dart';
+import 'package:ffmpeg_kit_flutter_new/ffmpeg_session.dart';
+import 'package:ffmpeg_kit_flutter_new/return_code.dart';
+import 'package:ffmpeg_kit_flutter_new/log.dart' as fflog;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // WaveformScreen
