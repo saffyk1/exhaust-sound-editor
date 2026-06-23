@@ -17,7 +17,7 @@ dependencies:
   video_player: ^2.9.1
 
   # FFmpeg audio processing (LTS bundle includes audio + video filters)
-  ffmpeg_kit_flutter_video: ^6.0.3
+  ffmpeg_kit_flutter_video: 6.0.3
 
   # Permissions handling (camera roll / storage)
   permission_handler: ^11.3.1
