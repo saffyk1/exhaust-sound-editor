@@ -71,7 +71,7 @@ Open `android/app/build.gradle` and update the `defaultConfig` block:
 android {
     defaultConfig {
         minSdkVersion 24        // ffmpeg_kit_flutter requires API 24 minimum
-        targetSdkVersion 34
+        targetSdkVersion 35
         ...
     }
 
@@ -107,7 +107,7 @@ flutter pub get
 ```
 
 This fetches all packages including:
-- `ffmpeg_kit_flutter_video ^6.0.3` — Video LTS FFmpeg bundle
+- `ffmpeg_kit_flutter_new: ^4.2.1` — Video LTS FFmpeg bundle
 - `gal ^1.3.0` — Gallery export (MediaStore on Android, PHPhotoLibrary on iOS)
 
 ---
@@ -154,7 +154,7 @@ fires `ACTION_MEDIA_SCANNER_SCAN_FILE` internally.
 - `-c:v copy` means the video track is **never decoded or re-encoded**.
   Only the audio stream is processed — a 2-minute 4K video typically
   exports in under 5 seconds on mid-range Android hardware.
-- `ffmpeg_kit_flutter_video` (LTS bundle) ships all audio filters used in
+- `ffmpeg_kit_flutter_new` (LTS bundle) ships all audio filters used in
   the pipeline (`highpass`, `lowpass`, `equalizer`, `acompressor`, `volume`,
   `alimiter`). No additional codec packs are needed.
 
