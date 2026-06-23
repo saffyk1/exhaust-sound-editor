@@ -1,5 +1,22 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.example.exhaust_studio">
+
+    <!-- ── Gallery read: Android 13+ (API 33+) ────────────────────────────── -->
+    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
+
+    <!-- ── Gallery read: Android 10–12 (API 29–32) ───────────────────────── -->
+    <uses-permission
+        android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32" />
+
+    <!-- ── Gallery write: Android 9 and below (API ≤28) ─────────────────── -->
+    <uses-permission
+        android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="28" />
+
+    <!-- ── Microphone ─────────────────────────────────────────────────────── -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+
    <application
         android:label="exhaust_studio"
         android:icon="@mipmap/ic_launcher">
