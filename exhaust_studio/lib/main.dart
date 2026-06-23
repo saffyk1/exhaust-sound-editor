@@ -191,7 +191,9 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
   // TIGHT (1.0): HPF=180Hz, LPF=4000Hz — aggressive wind & hiss removal
   int get _noiseHpfHz => (60 + (_noiseCleanup * 120)).round();
   int get _noiseLpfHz => (9000 - (_noiseCleanup * 5000)).round();
-  // Signal chain position: true = noise cleanup BEFORE preset, false = AFTER
+  // ON/OFF bypass for noise cancellation
+  bool _noiseCancellationEnabled = true;
+  // Signal chain position: true = noise cancellation BEFORE tuning, false = AFTER
   bool _noiseBeforePreset = true;
 
   // ── Enhanced preview state (loaded after processing, before final save) ────
@@ -397,9 +399,14 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
     final inputPath  = _videoFile!.path;
 
     final noiseFilter = 'highpass=f=$_noiseHpfHz, lowpass=f=$_noiseLpfHz';
-    final chainStr    = _noiseBeforePreset
-        ? '$noiseFilter, ${_params.filterChain}'
-        : '${_params.filterChain}, $noiseFilter';
+    final String chainStr;
+    if (_noiseCancellationEnabled) {
+      chainStr = _noiseBeforePreset
+          ? '$noiseFilter, ${_params.filterChain}'
+          : '${_params.filterChain}, $noiseFilter';
+    } else {
+      chainStr = _params.filterChain;
+    }
     final command = '-y -i "$inputPath" -c:v copy -af "$chainStr" "$tempOutput"';
 
     if (!mounted) return;
@@ -551,7 +558,7 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
         child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
           _buildVideoSection(),
           const SizedBox(height: 28),
-          _buildDividerLabel('NOISE CLEANUP'),
+          _buildDividerLabel('NOISE CANCELLATION'),
           const SizedBox(height: 14),
           _buildNoiseCleanupSection(),
           const SizedBox(height: 28),
@@ -572,81 +579,124 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
     );
   }
 
-  // ── Noise cleanup section ─────────────────────────────────────────────────
+  // ── Noise cancellation section ────────────────────────────────────────────
   Widget _buildNoiseCleanupSection() {
-    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-      Row(children: [
-        const Icon(Icons.filter_alt_outlined, color: Color(0xFFFF6B00), size: 16),
-        const SizedBox(width: 8),
-        const Text('NOISE CLEANUP',
-            style: TextStyle(fontFamily: 'monospace', fontWeight: FontWeight.w700, fontSize: 12, letterSpacing: 1.4, color: Color(0xFFCCCCCC))),
-        const Spacer(),
-        Text('HPF ${_noiseHpfHz}Hz · LPF ${_noiseLpfHz}Hz',
-            style: const TextStyle(fontFamily: 'monospace', fontSize: 10, color: Color(0xFFFF6B00), letterSpacing: 0.5)),
-      ]),
-      const SizedBox(height: 4),
-      const Padding(
-        padding: EdgeInsets.only(left: 24),
-        child: Text('Removes wind buffet, tyre hiss & road rumble',
-            style: TextStyle(fontSize: 10, color: Color(0xFF555555), letterSpacing: 0.3)),
+    return Container(
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: const Color(0xFF0F0F0F),
+        border: Border.all(color: const Color(0xFF1E1E1E)),
+        borderRadius: BorderRadius.circular(6),
       ),
-      SliderTheme(
-        data: SliderTheme.of(context).copyWith(
-          trackHeight: 3,
-          thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 9),
-        ),
-        child: Slider(
-          value: _noiseCleanup,
-          onChanged: (v) => setState(() => _noiseCleanup = v),
-        ),
-      ),
-      Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 12),
-        child: Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: const [
-          Text('OPEN', style: TextStyle(fontSize: 9, color: Color(0xFF444444), letterSpacing: 1)),
-          Text('TIGHT', style: TextStyle(fontSize: 9, color: Color(0xFF444444), letterSpacing: 1)),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+
+        // ── OFF toggle + slider ─────────────────────────────────────────────
+        Row(children: [
+          // OFF button
+          GestureDetector(
+            onTap: () => setState(() => _noiseCancellationEnabled = !_noiseCancellationEnabled),
+            child: AnimatedContainer(
+              duration: const Duration(milliseconds: 160),
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
+              decoration: BoxDecoration(
+                color: _noiseCancellationEnabled ? const Color(0xFF1A1A1A) : const Color(0xFF333333),
+                border: Border.all(color: _noiseCancellationEnabled ? const Color(0xFF2A2A2A) : const Color(0xFF888888)),
+                borderRadius: BorderRadius.circular(3),
+              ),
+              child: Text('OFF', style: TextStyle(
+                fontFamily: 'monospace', fontSize: 10, fontWeight: FontWeight.w700,
+                letterSpacing: 1.2,
+                color: _noiseCancellationEnabled ? const Color(0xFF444444) : const Color(0xFFCCCCCC),
+              )),
+            ),
+          ),
+          const SizedBox(width: 10),
+          // Slider
+          Expanded(
+            child: Opacity(
+              opacity: _noiseCancellationEnabled ? 1.0 : 0.3,
+              child: SliderTheme(
+                data: SliderTheme.of(context).copyWith(
+                  trackHeight: 3,
+                  thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 9),
+                ),
+                child: Slider(
+                  value: _noiseCleanup,
+                  onChanged: _noiseCancellationEnabled
+                      ? (v) => setState(() => _noiseCleanup = v)
+                      : null,
+                ),
+              ),
+            ),
+          ),
+          const SizedBox(width: 6),
+          Text('${(_noiseCleanup * 10).round() * 10}%',
+              style: const TextStyle(fontFamily: 'monospace', fontSize: 10, color: Color(0xFF555555))),
         ]),
-      ),
-      const SizedBox(height: 10),
-      // ── Signal chain position ───────────────────────────────────────────
-      Row(children: [
-        const Text('APPLY:', style: TextStyle(fontFamily: 'monospace', fontSize: 9, color: Color(0xFF555555), letterSpacing: 1.2)),
-        const SizedBox(width: 8),
-        _chainOrderTab('BEFORE PRESET', isActive: _noiseBeforePreset,  onTap: () => setState(() => _noiseBeforePreset = true)),
-        const SizedBox(width: 4),
-        _chainOrderTab('AFTER PRESET',  isActive: !_noiseBeforePreset, onTap: () => setState(() => _noiseBeforePreset = false)),
-      ]),
-      const SizedBox(height: 4),
-      Padding(
-        padding: const EdgeInsets.only(left: 52),
-        child: Text(
-          _noiseBeforePreset
-              ? 'Cleans raw audio first, then shapes exhaust tone'
-              : 'Shapes tone first, then removes any residual noise',
-          style: const TextStyle(fontSize: 9, color: Color(0xFF444444), letterSpacing: 0.2),
+
+        const SizedBox(height: 12),
+
+        // ── BEFORE TUNING / AFTER TUNING ────────────────────────────────────
+        Container(
+          padding: const EdgeInsets.all(3),
+          decoration: BoxDecoration(
+            color: const Color(0xFF0A0A0A),
+            border: Border.all(color: const Color(0xFF2A2A2A)),
+            borderRadius: BorderRadius.circular(4),
+          ),
+          child: Row(children: [
+            _chainOrderTab('BEFORE TUNING', isActive: _noiseBeforePreset,  onTap: () => setState(() => _noiseBeforePreset = true)),
+            _chainOrderTab('AFTER TUNING',  isActive: !_noiseBeforePreset, onTap: () => setState(() => _noiseBeforePreset = false)),
+          ]),
         ),
-      ),
-    ]);
+
+        const SizedBox(height: 10),
+
+        // ── Description ─────────────────────────────────────────────────────
+        Text(
+          _noiseCancellationEnabled
+              ? 'Targets sub-bass road rumble (<${_noiseHpfHz}Hz) and wind/hiss above exhaust range (>${_noiseLpfHz ~/ 1000}.${(_noiseLpfHz % 1000) ~/ 100}kHz) — independent of HPF/LPF/EQ settings'
+              : 'Noise cancellation bypassed — raw audio passes through unchanged',
+          style: const TextStyle(fontSize: 10, color: Color(0xFF555555), height: 1.5, letterSpacing: 0.2),
+        ),
+      ]),
+    );
   }
 
   Widget _chainOrderTab(String label, {required bool isActive, required VoidCallback onTap}) {
-    return GestureDetector(
-      onTap: onTap,
-      child: AnimatedContainer(
-        duration: const Duration(milliseconds: 160),
-        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
-        decoration: BoxDecoration(
-          color: isActive ? const Color(0xFF2A2A2A) : Colors.transparent,
-          border: Border.all(color: isActive ? const Color(0xFFFF6B00) : const Color(0xFF333333)),
-          borderRadius: BorderRadius.circular(3),
+    return Expanded(
+      child: GestureDetector(
+        onTap: onTap,
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 160),
+          padding: const EdgeInsets.symmetric(vertical: 8),
+          decoration: BoxDecoration(
+            color: isActive ? const Color(0xFF2A2A2A) : Colors.transparent,
+            borderRadius: BorderRadius.circular(3),
+          ),
+          alignment: Alignment.center,
+          child: Text(label, style: TextStyle(
+            fontFamily: 'monospace', fontSize: 10, letterSpacing: 1,
+            color: isActive ? const Color(0xFFE0E0E0) : const Color(0xFF555555),
+            fontWeight: isActive ? FontWeight.w700 : FontWeight.w400,
+          )),
         ),
-        child: Text(label, style: TextStyle(
-          fontFamily: 'monospace', fontSize: 9, letterSpacing: 1,
-          color: isActive ? const Color(0xFFFF6B00) : const Color(0xFF555555),
-          fontWeight: isActive ? FontWeight.w700 : FontWeight.w400,
-        )),
       ),
     );
+  }
+
+  // ── Preview command getter ─────────────────────────────────────────────────
+  String get _previewCommand {
+    final noiseFilter = 'highpass=f=$_noiseHpfHz, lowpass=f=$_noiseLpfHz';
+    final String chain;
+    if (_noiseCancellationEnabled) {
+      chain = _noiseBeforePreset
+          ? '$noiseFilter, ${_params.filterChain}'
+          : '${_params.filterChain}, $noiseFilter';
+    } else {
+      chain = _params.filterChain;
+    }
+    return '-y -i input.mp4 -c:v copy -af "$chain" output.mp4';
   }
 
   // ── Mode switcher ─────────────────────────────────────────────────────────
@@ -911,6 +961,38 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
         ),
       ),
 
+      // ── Audio hint (visible when enhanced is loaded) ─────────────────────
+      if (hasEnhanced) ...[
+        const SizedBox(height: 8),
+        Container(
+          width: double.infinity,
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
+          decoration: BoxDecoration(
+            color: const Color(0xFF0F0F0F),
+            border: Border.all(color: const Color(0xFF1E1E1E)),
+            borderRadius: BorderRadius.circular(4),
+          ),
+          child: Row(children: [
+            const Icon(Icons.volume_up_rounded, size: 13, color: Color(0xFF666666)),
+            const SizedBox(width: 8),
+            Expanded(child: RichText(text: TextSpan(
+              style: const TextStyle(fontFamily: 'monospace', fontSize: 10, color: Color(0xFF666666), letterSpacing: 0.3),
+              children: _showingEnhanced
+                  ? [
+                      const TextSpan(text: 'Enhanced audio. Tap '),
+                      const TextSpan(text: '◀ ORIGINAL', style: TextStyle(color: Color(0xFFAAAAAA), fontWeight: FontWeight.w700)),
+                      const TextSpan(text: ' to compare.'),
+                    ]
+                  : [
+                      const TextSpan(text: 'Original audio. Tap '),
+                      const TextSpan(text: 'ENHANCED ▶', style: TextStyle(color: Color(0xFFFF6B00), fontWeight: FontWeight.w700)),
+                      const TextSpan(text: ' to compare.'),
+                    ],
+            ))),
+          ]),
+        ),
+      ],
+
       if (!hasVideo) ...[
         const SizedBox(height: 12),
         OutlinedButton.icon(
@@ -1048,7 +1130,7 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
       ('VOL',  '${_params.volDb >= 0 ? '+' : ''}${_params.volDb.toStringAsFixed(1)}dB', 'Output level trim'),
       ('LIM',  '${_params.limDb.toStringAsFixed(1)}dBFS ceiling', 'Hard limiter — zero clip'),
     ];
-    return Column(children: stages.asMap().entries.map((entry) {
+    final stageWidgets = stages.asMap().entries.map<Widget>((entry) {
       final i = entry.key; final s = entry.value;
       return Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
         SizedBox(width: 44, child: Column(children: [
@@ -1064,7 +1146,28 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
           Text(s.$3, style: const TextStyle(fontSize: 11, color: Color(0xFF555555), height: 1.3)),
         ]))),
       ]);
-    }).toList());
+    }).toList();
+
+    return Column(children: [
+      ...stageWidgets,
+      // ── FFmpeg command preview ───────────────────────────────────────────
+      Container(
+        width: double.infinity,
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          color: const Color(0xFF080808),
+          border: Border.all(color: const Color(0xFF1E1E1E)),
+          borderRadius: BorderRadius.circular(4),
+        ),
+        child: Text(
+          _previewCommand,
+          style: const TextStyle(
+            fontFamily: 'monospace', fontSize: 9,
+            color: Color(0xFF555555), letterSpacing: 0.4, height: 1.5,
+          ),
+        ),
+      ),
+    ]);
   }
 
   // ── Enhance button ────────────────────────────────────────────────────────
