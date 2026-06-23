@@ -294,27 +294,76 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
   }
 
   // ── Permissions ────────────────────────────────────────────────────────────
-  Future<bool> _ensurePermissions() async {
-    PermissionStatus status;
+  Future<void> _ensurePermissions() async {
     if (Platform.isAndroid) {
-      status = await Permission.videos.request();
-      if (!status.isGranted) status = await Permission.storage.request();
+      // Android 13+ uses READ_MEDIA_VIDEO; older uses READ_EXTERNAL_STORAGE.
+      // Check status first — calling request() when already permanently denied
+      // silently returns without showing any dialog.
+      PermissionStatus status = await Permission.videos.status;
+      if (status.isDenied) {
+        status = await Permission.videos.request();
+      }
+      if (status.isPermanentlyDenied) {
+        _showOpenSettingsDialog(); return;
+      }
+
+      if (!status.isGranted) {
+        // Fallback for Android ≤12 where READ_MEDIA_VIDEO is not available.
+        PermissionStatus legacy = await Permission.storage.status;
+        if (legacy.isDenied) legacy = await Permission.storage.request();
+        if (legacy.isPermanentlyDenied) {
+          _showOpenSettingsDialog(); return;
+        }
+      }
     } else {
-      status = await Permission.photos.request();
+      final status = await Permission.photos.request();
+      if (status.isPermanentlyDenied) { _showOpenSettingsDialog(); return; }
     }
-    return status.isGranted;
+  }
+
+  void _showOpenSettingsDialog() {
+    if (!mounted) return;
+    showDialog(
+      context: context,
+      builder: (_) => AlertDialog(
+        backgroundColor: const Color(0xFF1E1E1E),
+        title: const Text('Permission Required',
+            style: TextStyle(color: Color(0xFFE8E8E8), fontFamily: 'monospace', fontSize: 15)),
+        content: const Text(
+            'Gallery access was denied. Open the app Settings to grant it, then come back.',
+            style: TextStyle(color: Color(0xFFB0B0B0), height: 1.5)),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('CANCEL', style: TextStyle(color: Color(0xFF666666), fontFamily: 'monospace', fontSize: 12)),
+          ),
+          TextButton(
+            onPressed: () { Navigator.pop(context); openAppSettings(); },
+            child: const Text('OPEN SETTINGS', style: TextStyle(color: Color(0xFFFF6B00), fontFamily: 'monospace', fontSize: 12)),
+          ),
+        ],
+      ),
+    );
   }
 
   // ── Video picking ──────────────────────────────────────────────────────────
   Future<void> _pickVideo() async {
     if (_isLoading) return;
-    final granted = await _ensurePermissions();
-    if (!granted) { _showStatus('Storage permission denied.', isError: true); return; }
-    final XFile? picked = await _picker.pickVideo(source: ImageSource.gallery);
-    if (picked == null) return;
-    final file = File(picked.path);
-    await _initVideoController(file);
-    setState(() => _videoFile = file);
+    // Request permissions first (shows dialog if not yet decided, or opens
+    // Settings dialog if permanently denied). On Android 13+ the system Photo
+    // Picker can work even without READ_MEDIA_VIDEO, so we don't abort here —
+    // we let the picker itself surface any remaining access issues.
+    await _ensurePermissions();
+
+    try {
+      final XFile? picked = await _picker.pickVideo(source: ImageSource.gallery);
+      if (picked == null) return;
+      final file = File(picked.path);
+      await _initVideoController(file);
+      setState(() => _videoFile = file);
+    } catch (e) {
+      _showStatus('Could not open video picker: $e', isError: true);
+    }
   }
 
   Future<void> _initVideoController(File file) async {
